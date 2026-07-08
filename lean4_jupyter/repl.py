@@ -47,10 +47,77 @@ class Lean4ReplOutput:
 
 class Lean4ReplWrapper:
 
+    @staticmethod
+    def _find_lake_root(start='.'):
+        d = os.path.abspath(start)
+        for _ in range(12):
+            if os.path.isfile(os.path.join(d, 'lakefile.lean')) or \
+               os.path.isfile(os.path.join(d, 'lakefile.toml')):
+                return d
+            p = os.path.dirname(d)
+            if p == d:
+                return None
+            d = p
+        return None
+
+    @staticmethod
+    def _repl_for_toolchain(lake_root):
+        """Pick a REPL binary matching the lake's toolchain.
+        ``~/.elan/bin/repl`` is stable-locked; rc1/rc2 lakes need a matched REPL
+        (built via ``setup_native_lean4_import.py build-repl <tag>``)."""
+        default = os.path.expanduser('~/.elan/bin/repl')
+        # toolchain tag -> canonical matched-REPL name (inlined; keep in sync
+        # with REPL_TOOLCHAIN_TAGS in setup_native_lean4_import.py).
+        mapping = {'v4.30.0-rc2': 'repl-4.30.0-rc2',
+                   'v4.31.0-rc1': 'repl-4.31.0-rc1'}
+        try:
+            tc_file = os.path.join(lake_root, 'lean-toolchain')
+            tc = open(tc_file).read().strip() if os.path.isfile(tc_file) else ''
+        except OSError:
+            tc = ''
+        elan_bin = os.path.expanduser('~/.elan/bin')
+        for tag, name in mapping.items():
+            if tag in tc:
+                p = os.path.join(elan_bin, name)
+                if os.path.isfile(p):
+                    return p
+        return default
+
     @classmethod
     def launch(cls):
+        """Native-import path: launch the REPL binary DIRECT (not via ``lake env``)
+        with the lake's LEAN_PATH when running inside a lake workspace. ``lake env
+        repl`` clobbers the REPL sysroot (loses Init); direct launch with
+        LEAN_PATH=sysroot+deps+Mathlib restores native Mathlib-lake import."""
+        try:
+            lake_root = cls._find_lake_root(os.getcwd())
+            if lake_root:
+                import subprocess as _sp
+                out = _sp.run(
+                    ['lake', 'env', 'python3', '-c',
+                     'import os; print(os.environ.get("LEAN_PATH",""))'],
+                    # timeout=240 (not 60): on rc1 lakes whose Mathlib is an NTFS
+                    # junction, `lake env` re-verifies the junction ("has local
+                    # changes") and takes ~111-125s (measured c.129). timeout=60
+                    # tripped RC1-TIMEOUT -> empty LEAN_PATH -> broken `lake env
+                    # repl` fallback -> silent kernel failure. 240s = ~2x margin.
+                    capture_output=True, text=True, timeout=240, cwd=lake_root,
+                    env={**os.environ,
+                         'PATH': os.path.expanduser('~/.elan/bin') + ':/usr/local/bin:/usr/bin:/bin'}
+                ).stdout
+                lean_path = '\n'.join(
+                    l for l in out.splitlines() if 'local changes' not in l).strip()
+                repl_bin = cls._repl_for_toolchain(lake_root)
+                if lean_path and os.path.isfile(repl_bin):
+                    env = {**os.environ, 'LEAN_PATH': lean_path,
+                           'PATH': os.path.expanduser('~/.elan/bin') + ':/usr/local/bin:/usr/bin:/bin'}
+                    return pexpect.spawn(repl_bin, echo=False, encoding='utf-8',
+                                         codec_errors='replace', env=env)
+        except Exception:
+            pass
         return pexpect.spawn("lake env repl",
                              echo=False, encoding='utf-8', codec_errors='replace')
+
 
     def init(self):
         self.check()
